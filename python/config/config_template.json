@@ -4,7 +4,7 @@
         "_type": "Type of cloud (options: 'filament_cloud', 'particle_cloud', 'filament_particle_cloud')",
 
         "particle": {
-            "n_particle": 11,
+            "n_particle": 500,
             "_n_particle": "Number of particles",
 
             "min_dist": 2.1,
@@ -61,17 +61,31 @@
         "dt": 0.005,
         "_dt": "Time step size for the simulation",
 
-        "t_max": 0.1,
+        "t_max": 0.01,
         "_t_max": "Final time for the simulation",
 
         "t_meas": 2,
         "_t_meas": "Measurement interval: how often (in time steps) to record output data",
+
+        "divm": {
+            "enabled": true,
+            "_enabled": "Whether to add the divM drift contribution to velocity",
+
+            "temperature": 300.0,
+            "_temperature": "Temperature in Kelvin used when scale is null",
+
+            "boltzmann_constant": 1.380649e-23,
+            "_boltzmann_constant": "Boltzmann constant used when scale is null",
+
+            "scale": null,
+            "_scale": "Override prefactor for divM; null uses boltzmann_constant * temperature"
+        },
 
         "_description": "Simulation configuration parameters"
     },
 
     "model": {
         "two_body_model": "nn/two_body_unbounded",
-        "_two_body_model": "Path to the neural network model"
+        "_two_body_model": "Path to the two-body neural network model"
     }
 }

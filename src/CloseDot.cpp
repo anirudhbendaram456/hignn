@@ -1,32 +1,47 @@
 #include <algorithm>
-
+#include <torch/csrc/autograd/grad_mode.h>
 #include "HignnModel.hpp"
+#include "Typedef.hpp"
 
 using namespace std;
 
-void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
+void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoubleMatrix divM) {
   std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+  // Captures the current time to start measuring elapsed time for performance
+  // tracking.
 
   if (mMPIRank == 0)
     std::cout << "start of CloseDot" << std::endl;
 
+  // Timing variables to track the execution duration of query and dot
+  // operations.
   double queryDuration = 0;
   double dotDuration = 0;
 
+  // Set the total number of close node pairs and the maximum size of the batch
+  // that will be processed at once.
   const int closeNodeSize = mCloseMatIPtr->extent(0);
-  const int maxWorkSize = 1000;
+  // Stores the number of close node pairs to be processed.
+  const int maxWorkSize = 1000;  // Maximum close node pairs per batch.
   int workSize = std::min(maxWorkSize, closeNodeSize);
-  int finishedNodeSize = 0;
+  // Close node pairs for current batch, constrained by
+  // maxWorkSize and the number of close node pairs.
+  int finishedNodeSize = 0;  // Number of node pairs that have been processed.
 
+  // Variables to track the total number of queries and iterations processed.
   std::size_t totalNumQuery = 0;
   std::size_t totalNumIter = 0;
 
+  // Vectors for storing relative coordinates and node work assignments.
   DeviceFloatVector relativeCoordPool("relativeCoordPool",
                                       mMaxRelativeCoord * 3);
+  // Stores the relative coordinates of the particles.
 
   DeviceIntVector workingNode("workingNode", maxWorkSize);
+  // Holds node indices for the current batch.
 
   DeviceIntVector relativeCoordSize("relativeCoordSize", maxWorkSize);
+  // Stores work size for each node pair.
   DeviceIntVector relativeCoordOffset("relativeCoordOffset", maxWorkSize);
 
   auto &mCloseMatI = *mCloseMatIPtr;
@@ -36,16 +51,23 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
 
   bool useSymmetry = mUseSymmetry;
 
+  // Begin processing node pairs in batches
   while (finishedNodeSize < closeNodeSize) {
     {
       workSize = min(maxWorkSize, closeNodeSize - finishedNodeSize);
+      // Update work size based on remaining node pairs.
 
+      // Define bounds for adjusting work size.
       int lowerWorkSize = 0;
       int upperWorkSize = workSize;
 
+      // Dynamically adjust work size based on estimated workload.
       while (true) {
         int estimatedWorkload = 0;
+        // Variable to store the estimated workload for the current batch.
 
+        // Parallel reduction to estimate workload by summing the work sizes of
+        // node pairs.
         Kokkos::parallel_reduce(
             Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, workSize),
             KOKKOS_LAMBDA(const std::size_t i, int &tSum) {
@@ -59,20 +81,26 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
               const int indexJEnd = mClusterTree(nodeJ, 3);
               const int workSizeJ = indexJEnd - indexJStart;
 
-              tSum += workSizeI * workSizeJ;
+              tSum += workSizeI * workSizeJ;  // Update the total estimated
+                                              // workload for the batch.
             },
             Kokkos::Sum<int>(estimatedWorkload));
 
+        // Adjustment of work size if estimated workload exceeds the maximum
+        // allowed.
         if (estimatedWorkload > (int)mMaxRelativeCoord) {
           upperWorkSize = workSize;
           workSize = (lowerWorkSize + upperWorkSize) / 2;
+          // Refine work size to distribute workload.
         } else {
           if (upperWorkSize - lowerWorkSize <= 1) {
             workSize = max(1, lowerWorkSize);
+            // Finalize work size if difference between bounds is small.
             break;
           } else {
             lowerWorkSize = workSize;
             workSize = (lowerWorkSize + upperWorkSize) / 2;
+            // Continue refining work size.
           }
         }
       }
@@ -82,6 +110,7 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, workSize),
         KOKKOS_LAMBDA(const std::size_t i) {
           workingNode(i) = i + finishedNodeSize;
+          // Assign node pairs to be processed in this batch.
         });
     Kokkos::fence();
 
@@ -104,24 +133,29 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
           const int workSizeJ = indexJEnd - indexJStart;
 
           relativeCoordSize(rank) = workSizeI * workSizeJ;
+          // Store the work size for this batch.
 
           tSum += workSizeI * workSizeJ;
+          // Update the total coordinate count.
         },
         Kokkos::Sum<int>(totalCoord));
     Kokkos::fence();
 
     totalNumQuery += totalCoord;
+    // Update the total number of queries.
+
     Kokkos::parallel_for(
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, workSize),
         KOKKOS_LAMBDA(const int rank) {
           relativeCoordOffset(rank) = 0;
           for (int i = 0; i < rank; i++) {
             relativeCoordOffset(rank) += relativeCoordSize(i);
+            // Calculate offset for relative coordinates.
           }
         });
     Kokkos::fence();
 
-    // calculate the relative coordinates
+    // Calculate the relative coordinates.
     Kokkos::parallel_for(
         Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>(workSize,
                                                           Kokkos::AUTO()),
@@ -152,25 +186,44 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                 for (int l = 0; l < 3; l++) {
                   relativeCoordPool(3 * index + l) =
                       mCoord(indexJStart + k, l) - mCoord(indexIStart + j, l);
+                  // Calculate relative coordinate.
                 }
               });
         });
     Kokkos::fence();
 
-    // do inference
+    const float minDivMRelativeDistance2 = 1e-12f;
+    DeviceIntVector validDivMPair("validDivMPair", totalCoord);
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, totalCoord),
+        KOKKOS_LAMBDA(const int i) {
+          const float dx = relativeCoordPool(3 * i);
+          const float dy = relativeCoordPool(3 * i + 1);
+          const float dz = relativeCoordPool(3 * i + 2);
+          const float r2 = dx * dx + dy * dy + dz * dz;
+          validDivMPair(i) =
+              (isfinite(r2) && r2 > minDivMRelativeDistance2) ? 1 : 0;
+        });
+    Kokkos::fence();
+    auto hostValidDivMPair = Kokkos::create_mirror_view(validDivMPair);
+    Kokkos::deep_copy(hostValidDivMPair, validDivMPair);
+
+    // prepare the inference model.
 #if USE_GPU
     auto options = torch::TensorOptions()
                        .dtype(torch::kFloat32)
                        .device(torch::kCUDA, mCudaDevice)
-                       .requires_grad(false);
+                       .requires_grad(true); //change to true
 #else
     auto options = torch::TensorOptions()
                        .dtype(torch::kFloat32)
                        .device(torch::kCPU)
-                       .requires_grad(false);
+                       .requires_grad(true); //change to true
 #endif
+    // .clone() makes PyTorch own a copy of the Kokkos buffer so autograd
+    // doesn't hold a reference to memory Kokkos may reuse next iteration.
     torch::Tensor relativeCoordTensor =
-        torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options);
+        torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options).clone();
     std::vector<c10::IValue> inputs;
     inputs.push_back(relativeCoordTensor);
 
@@ -178,6 +231,42 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
         std::chrono::steady_clock::now();
 
     auto resultTensor = mTwoBodyModel.forward(inputs).toTensor();
+
+    DeviceFloatMatrix divMPairs("divMPairs", totalCoord, 3);
+    auto hostDivMPairs = Kokkos::create_mirror_view(divMPairs);
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0,
+                                                               totalCoord * 3),
+        [&](const int i) {
+          hostDivMPairs(i / 3, i % 3) = 0.0;
+        });
+    Kokkos::fence();
+
+    for (int k = 0; k < 9; k++) {
+      auto out = resultTensor.index({torch::indexing::Slice(), k}).sum();
+      const bool retainGraph = k < 8;
+      auto grad = torch::autograd::grad({out}, {relativeCoordTensor}, {},
+                                        retainGraph, false, false)[0]
+                      .detach()
+                      .to(torch::kCPU)
+                      .contiguous();
+      if (grad.numel() != totalCoord * 3) {
+        throw std::runtime_error("Unexpected CloseDot gradient size");
+      }
+      auto gradPtr = grad.data_ptr<float>();
+      const int row = k / 3;
+      const int col = k % 3;
+      for (int i = 0; i < totalCoord; i++) {
+        if (!hostValidDivMPair(i)) {
+          continue;
+        }
+        const float gradValue = gradPtr[3 * i + col];
+        if (std::isfinite(gradValue)) {
+          hostDivMPairs(i, row) += gradValue;
+        }
+      }
+    }
+    Kokkos::deep_copy(divMPairs, hostDivMPairs);
 
     std::chrono::steady_clock::time_point end =
         std::chrono::steady_clock::now();
@@ -187,7 +276,9 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
 
     begin = std::chrono::steady_clock::now();
 
-    auto dataPtr = resultTensor.data_ptr<float>();
+    // Store contiguous version to keep tensor alive and ensure sequential layout.
+    auto resultTensor_contiguous = resultTensor.detach().contiguous();
+    auto dataPtr = resultTensor_contiguous.data_ptr<float>();
 
     Kokkos::parallel_for(
         Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>(workSize,
@@ -221,6 +312,9 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                         dataPtr[9 * (relativeOffset + index) + row * 3 + col] *
                         f(indexJStart + k, col);
                   Kokkos::atomic_add(&u(indexIStart + j, row), sum);
+                  Kokkos::atomic_add(&divM(indexIStart + j, row),
+                                     (double)divMPairs(relativeOffset + index, row));
+                  // Accumulate results to u and divM
                 }
               });
 
@@ -238,6 +332,7 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                                        col] *
                                f(indexIStart + j, col);
                       Kokkos::atomic_add(&u(indexJStart + k, row), sum);
+                      // Perform symmetry-based updates to u.
                     }
                   });
             }
@@ -250,18 +345,24 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
             .count();
 
     finishedNodeSize += workSize;
+    // Update the count of processed node pairs.
   }
 
   MPI_Allreduce(MPI_IN_PLACE, &totalNumQuery, 1, MPI_LONG, MPI_SUM,
                 MPI_COMM_WORLD);
+  // Aggregate total number of queries across all MPI processes.
   MPI_Allreduce(MPI_IN_PLACE, &totalNumIter, 1, MPI_LONG, MPI_SUM,
                 MPI_COMM_WORLD);
+  ;  // Aggregate total number of iterations across all MPI processes.
   MPI_Allreduce(MPI_IN_PLACE, &queryDuration, 1, MPI_DOUBLE, MPI_MAX,
                 MPI_COMM_WORLD);
+  // Aggregate query duration across all MPI processes.
   MPI_Allreduce(MPI_IN_PLACE, &dotDuration, 1, MPI_DOUBLE, MPI_MAX,
                 MPI_COMM_WORLD);
+  // Aggregate dot duration across all MPI processes.
 
   std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+  // End the timer for performance tracking.
 
   if (mMPIRank == 0) {
     printf(
