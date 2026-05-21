@@ -130,7 +130,6 @@ def velocity_update(hignn_model, t, position, b, n_filament, n_chain, rest_lengt
     velocity = np.zeros((position.shape[0], 3), dtype=np.float32)
     force = np.zeros((position.shape[0], 3), dtype=np.float32)
     force[:, 2] = b[2]
-    
     # Filaments
     if (n_filament > 0):
         for i in range(n_filament):

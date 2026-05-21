@@ -291,6 +291,25 @@ def input_ftsuoe(n, posdata, frameno, timestep, last_velocities, input_form='und
     #     # sphere_positions is ignored here, but to activate periodicity, you have to set box_bottom_left and box_top_right.
     #     desc = "gravity-periodic"
 
+    elif n == 60:
+        # Hold-all-spheres-fixed in simple shear (choose your flow below)
+        # Vel/angvel of particles = 0  -> solver returns holding forces
+        Ua_in[:] = [[0,0,0] for _ in xrange(num_spheres)]
+        Oa_in[:] = [[0,0,0] for _ in xrange(num_spheres)]
+
+        # --- choose ONE flow style ---
+
+        # (A) Simple shear with rate gammadot
+        # gammadot = 1.0
+        # O_infinity = np.array([0, 0.5*gammadot, 0])
+        # Ea_in = [[[0,0,0.5*gammadot],[0,0,0],[0.5*gammadot,0,0]] for _ in xrange(max(1,num_spheres))]
+
+        # (B) Uniform translation (uncomment to use instead)
+        U_infinity = np.array([1.0, 0.0, 0.0]); O_infinity = np.array([0,0,0])
+        Ea_in = [[[0,0,0],[0,0,0],[0,0,0]] for _ in xrange(max(1,num_spheres))]
+
+        desc = "hold-fixed-flow"
+
     else:
         Fa_in = np.array([[99999, -31415, 21718]])  # Just something to flag up on the other side that there's a problem
 

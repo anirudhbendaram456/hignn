@@ -1,0 +1,30 @@
+{
+    "cloud": {
+        "type": "rigid_rod_cloud",
+        "filament": {
+            "n_filament": 1024,
+            "n_chain": 5,
+            "rest_length": 2.4,
+            "min_dist": 2.1,
+            "R1": 0.0,
+            "R2": 60.0,
+            "k_t": 20,
+            "k_b": 1000
+        },
+        "seed": 0
+    },
+    "simulation": {
+        "time_integrator": "Explicit Euler",
+        "body_force": [
+            0.0,
+            0.0,
+            -1.0
+        ],
+        "dt": 0.001,
+        "t_max": 20,
+        "t_meas": 50
+    },
+    "model": {
+        "two_body_model": "nn/two_body_unbounded"
+    }
+}

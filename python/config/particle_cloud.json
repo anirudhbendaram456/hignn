@@ -1,11 +1,11 @@
 {
     "cloud": {
-        "type": "particle_cloud",
+        "type": "particle_cloud1",
         "particle": {
-            "n_particle": 21504,
-            "min_dist": 2.1,
+            "n_particle": 90159,
+            "min_dist": 2.0,
             "R1": 0.0,
-            "R2": 240.0
+            "R2": 30
         },
         "seed": 0
     },
@@ -16,9 +16,9 @@
             0.0,
             -1.0
         ],
-        "dt": 0.1,
-        "t_max": 10.0,
-        "t_meas": 100
+        "dt": 0.001,
+        "t_max": 100,
+        "t_meas": 3000
         
     },
     "model": {

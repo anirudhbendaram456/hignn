@@ -431,8 +431,26 @@ class CloudGenerator:
     )
         
     cloud.generate()
-    
+
     dir_name = './python/cloud'
     file_name = os.path.join(dir_name, cloud_type + '.pos')
-    os.makedirs(dir_name, exist_ok=True)
-    np.savetxt(file_name, cloud.positions)
+
+    # … after generating the first drop …
+    positions1 = cloud.positions.copy()
+    np.savetxt(os.path.join(dir_name, cloud_type + '_drop1.pos'), positions1)
+
+    # regenerate for second drop
+    np.random.seed(cloud_seed + 1)
+    cloud.generate()
+    positions2 = cloud.positions.copy()
+    # this line shifts the second drop by the diameter (2×175)
+    positions2 += np.array([0, 0, 180], dtype=np.float32)
+
+    np.savetxt(os.path.join(dir_name, cloud_type + '_drop2.pos'), positions2)
+
+    # now merge for the simulator
+    merged = np.vstack((positions1, positions2))
+    np.savetxt(file_name, merged)
+
+    # os.makedirs(dir_name, exist_ok=True)
+    # np.savetxt(file_name, cloud.positions)

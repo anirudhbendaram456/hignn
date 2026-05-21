@@ -14,7 +14,7 @@ def velocity_update(t, position):
     hignn_model.update_coord(position[:, 0:3])
     velocity = np.zeros((position.shape[0], 3), dtype=np.float32)
     force = np.zeros((position.shape[0], 3), dtype=np.float32)
-    force[:, 2] = -1.0
+    force[:, 0] = 10.0
     
     hignn_model.dot(velocity, force)
     
@@ -28,9 +28,9 @@ if __name__ == '__main__':
     
     N = 5
     nx = N
-    ny = N
-    nz = N
-    dx = 3
+    ny = 1
+    nz = 1
+    dx = 2.01
     x = np.arange(0, nx * dx, dx)
     y = np.arange(0, ny * dx, dx)
     z = np.arange(0, nz * dx, dx)
@@ -45,9 +45,10 @@ if __name__ == '__main__':
     
     NN = X.shape[0]
 
-    hignn_model = hignn.HignnModel(X, 50)
+    hignn_model = hignn.HignnModel(X, 2)
     
-    hignn_model.load_two_body_model('nn/3D_force_UB_max600_try2')
+    hignn_model.load_two_body_model('nn/two_body_unbounded')
+    # hignn_model.load_three_body_model('nn/three_body')
     
     # set parameters for far dot, the following parameters are default values
     hignn_model.set_epsilon(0.1)
@@ -76,12 +77,12 @@ if __name__ == '__main__':
     #         print(i)
     #     v = velocity_update(0, X)
     ts = 0
-    dt = 0.005
+    dt = 0.01
     ite = 0
     
     t1 = time.time()
 
-    for i in range(2):
+    for i in range(5001):
         with h5py.File('Result/pos'+str(ite)+'rank'+str(rank)+'.h5', 'w') as f:
             f.create_dataset('pos', data=X[rank_range[rank]:rank_range[rank+1], :])
         
@@ -102,6 +103,12 @@ if __name__ == '__main__':
 
     if rank == 0:
         print("Time for simulation: {t:.4f}s".format(t = time.time() - t1))
+
+        # 3rd particle is index 2
+        vel3 = V[2]
+        print(f"Final velocity of the 3rd particle: {vel3}")
+        drag = 1/(6*np.pi*vel3)
+        print(f"Final Drag coefficient on the 3rd particle: {drag}")
    
     # edgeInfo = hignn.BodyEdgeInfo()
     # edgeInfo.setThreeBodyEpsilon(5.0)

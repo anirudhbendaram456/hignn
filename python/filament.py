@@ -57,12 +57,13 @@ def velocity_update(t, position):
     force[:, 2] = -1.0
     
     # filaments
-    n_chain = 100
+    n_chain = 31
     num_chains = int(position.shape[0] / n_chain)
     k_t = 100 # tension stiffness coefficient
     k_b = 30 # bending stiffness coefficient
     rest_length = 2.4
     for i in range(num_chains):
+        
         force[n_chain * i:n_chain * i + n_chain, :] += chain_bending(position[n_chain * i:n_chain * i + n_chain, :], k_b)
         force[n_chain * i:n_chain * i + n_chain, :] += chain_tension(position[n_chain * i:n_chain * i + n_chain, :], k_t, rest_length)
     
@@ -78,27 +79,61 @@ if __name__ == '__main__':
     
     np.random.seed(0)
     
-    n_chain = 100
-    nx = 5
-    ny = 5
-    nz = n_chain
-    dx = 3
-    dy = 3
-    dz = 2.4
-    x = np.arange(0, nx * dx, dx)
-    y = np.arange(0, ny * dy, dy)
-    z = np.arange(0, nz * dz, dz)
-    zz, yy, xx = np.meshgrid(x, y, z)
-    X = np.concatenate(
-        (xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)), axis=1)
-    X = X.astype(np.float32)
+    # n_chain = 31
+    # nx = 1
+    # ny = 1
+    # nz = n_chain
+    # dx = 3
+    # dy = 3
+    # dz = 2.4
+    # x = np.arange(0, nx * dx, dx)
+    # y = np.arange(0, ny * dy, dy)
+    # z = np.arange(0, nz * dz, dz)
+
+    # # total vertical span
+    # z_max = (n_chain - 1) * dz
+
+    # # 1) generate your random z-coordinates
+    # # z_rand = np.random.rand(n_chain) * z_max
+
+    # # Create angles from 0→π (one half‐wave)
+    # theta = np.linspace(0, np.pi, n_chain)
+    # # Map sin(θ) ∈ [0,1] and scale to [0, z_max]
+    # z_sine = np.sin(theta) * z_max
+
+    # zz, yy, xx = np.meshgrid(x, y, z)
+    # X = np.concatenate(
+    #     (xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)), axis=1)
+    # X = X.astype(np.float32)
+
+    n_chain = 31
+    dx      = 3.0
+    dz      = 2.4
+
+    x = np.arange(n_chain) * dx
+    y = np.array([0.0])
+    z_rand = np.random.rand(n_chain) * ((n_chain-1)*dz)
+
+    # full 3D grid:
+    Xp, Yp, Zp = np.meshgrid(x, y, z_rand, indexing='ij')  
+    #   Xp.shape == (n_chain, 1, n_chain)
+    #   Yp       == all zeros
+    #   Zp       == each row is one z_rand vector
+
+    # take the "diagonal" through that 2D slice so
+    # (x[0],z_rand[0]), (x[1],z_rand[1]), …, (x[n_chain-1],z_rand[n_chain-1])
+    xp = np.diagonal(Xp[:, 0, :])
+    yp = np.zeros_like(xp)
+    zp = np.diagonal(Zp[:, 0, :])
+
+    X = np.column_stack((xp, yp, zp)).astype(np.float32)
     X += np.random.rand(X.shape[0], X.shape[1]) * 0.5
     
     NN = X.shape[0]
 
-    hignn_model = hignn.HignnModel(X, 100)
+    hignn_model = hignn.HignnModel(X, 15)
     
-    hignn_model.load_two_body_model('nn/3D_force_UB_max600_try2')
+    hignn_model.load_two_body_model('nn/two_body_unbounded')
     
     # set parameters for far dot, the following parameters are default values
     hignn_model.set_epsilon(0.01)
@@ -118,8 +153,8 @@ if __name__ == '__main__':
     t1 = time.time()
 
     for i in range(50000):
-        if i % 100 == 0:
-            with h5py.File('Result/pos'+str(int(i/100))+'rank'+str(rank)+'.h5', 'w') as f:
+        if i % 1 == 0:
+            with h5py.File('Result/pos'+str(int(i/1))+'rank'+str(rank)+'.h5', 'w') as f:
                 f.create_dataset('pos', data=X[rank_range[rank]:rank_range[rank+1], :])
         
         tt1 = time.time()
@@ -127,8 +162,8 @@ if __name__ == '__main__':
         if rank == 0:
             print("Time for velocity_update: {t:.4f}s".format(t = time.time() - tt1))
 
-        if i % 100 == 0:
-            with h5py.File('Result/vel'+str(int(i/100))+'rank'+str(rank)+'.h5', 'w') as f:
+        if i % 1 == 0:
+            with h5py.File('Result/vel'+str(int(i/1))+'rank'+str(rank)+'.h5', 'w') as f:
                 f.create_dataset('vel', data=V[rank_range[rank]:rank_range[rank+1], :])
         
         X = X + dt * V
