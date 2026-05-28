@@ -209,27 +209,46 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoub
     Kokkos::deep_copy(hostValidDivMPair, validDivMPair);
 
     // prepare the inference model.
+// #if USE_GPU
+//     auto options = torch::TensorOptions()
+//                        .dtype(torch::kFloat32)
+//                        .device(torch::kCUDA, mCudaDevice)
+//                        .requires_grad(true); //change to true
+// #else
+//     auto options = torch::TensorOptions()
+//                        .dtype(torch::kFloat32)
+//                        .device(torch::kCPU)
+//                        .requires_grad(true); //change to true
+// #endif
 #if USE_GPU
     auto options = torch::TensorOptions()
                        .dtype(torch::kFloat32)
-                       .device(torch::kCUDA, mCudaDevice)
-                       .requires_grad(true); //change to true
+                       .device(torch::kCUDA, mCudaDevice);
 #else
     auto options = torch::TensorOptions()
                        .dtype(torch::kFloat32)
-                       .device(torch::kCPU)
-                       .requires_grad(true); //change to true
+                       .device(torch::kCPU);
 #endif
     // .clone() makes PyTorch own a copy of the Kokkos buffer so autograd
     // doesn't hold a reference to memory Kokkos may reuse next iteration.
+    // torch::Tensor relativeCoordTensor =
+    //     torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options).clone();
+    // std::vector<c10::IValue> inputs;
+    // inputs.push_back(relativeCoordTensor);
+
     torch::Tensor relativeCoordTensor =
-        torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options).clone();
+        torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options)
+            .clone()
+            .detach();
+    relativeCoordTensor.set_requires_grad(true);
+
     std::vector<c10::IValue> inputs;
     inputs.push_back(relativeCoordTensor);
 
     std::chrono::steady_clock::time_point begin =
         std::chrono::steady_clock::now();
-
+    
+    torch::AutoGradMode enable_grad(true);
     auto resultTensor = mTwoBodyModel.forward(inputs).toTensor();
 
     DeviceFloatMatrix divMPairs("divMPairs", totalCoord, 3);
@@ -333,6 +352,13 @@ void HignnModel::CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoub
                                f(indexIStart + j, col);
                       Kokkos::atomic_add(&u(indexJStart + k, row), sum);
                       // Perform symmetry-based updates to u.
+
+                      // Symmetric divM contribution.
+                      // Direct pair used r_ij = X_j - X_i.
+                      // For the symmetric row J, source coordinate is X_i,
+                      // so d/dr gets a negative sign.
+                      Kokkos::atomic_add(&divM(indexJStart + k, row),
+                                        -(double)divMPairs(relativeOffset + index, row));
                     }
                   });
             }
