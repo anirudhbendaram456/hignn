@@ -34,6 +34,7 @@
 #include <string>
 
 #include <torch/script.h>
+#include <torch/torch.h>
 
 using namespace std::chrono;
 
@@ -165,6 +166,12 @@ protected:
 
   bool mUseSymmetry;
   //!< Flag to enable/disable the use of symmetry in calculations.
+
+  bool mComputeDivM;
+  //!< Flag to enable/disable divergence-of-mobility calculations.
+
+  bool mCloseDotDebugFlag;
+  //!< Flag to enable/disable CloseDot autograd diagnostic prints.
 
 protected:
   /**
@@ -365,7 +372,7 @@ public:
    * @param f [in] A 2D array of size (num_particles, 3) representing the forces
    * applied to the particles.
    */
-  void CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f);
+  void CloseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoubleMatrix divM);
 
   /**
    * @brief Evaluates the updated velocity due to far-range hydrodynamic
@@ -390,7 +397,7 @@ public:
    * @param f [in] A 2D array of size (num_particles, 3) representing the forces
    * applied to the particles.
    */
-  void FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f);
+  void FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoubleMatrix divM);
 
   /**
    * @brief Computes the updated velocities using the original two-body
@@ -411,6 +418,9 @@ public:
    * @param f [in] A matrix of size (num_particles, 3) representing the forces
    * applied to the particles.
    */
+
+  void FarDivDot(DeviceDoubleMatrix divM);
+
   void DenseDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f);
 
   /**
@@ -438,7 +448,7 @@ public:
    * @param fArray [in]  Input array (num_particles, 3) of forces acting on each
    * particle.
    */
-  void Dot(pybind11::array_t<float> &uArray, pybind11::array_t<float> &fArray);
+  void Dot(pybind11::array_t<float> &uArray, pybind11::array_t<float> &fArray, pybind11::array_t<float> &divMArray);
 
   /**
    * @brief Computes hydrodynamic interaction and update the velocities from the
@@ -544,6 +554,24 @@ public:
    * (true) or disabled (false).
    */
   void SetUseSymmetryFlag(const bool flag);
+
+  /**
+   * @brief Sets the flag to enable or disable divergence-of-mobility
+   * calculations in Dot.
+   *
+   * When disabled, Dot computes only velocity and keeps Torch autograd disabled
+   * in the CloseDot/FarDot inference paths.
+   *
+   * @param flag [in] A boolean flag indicating whether divM is computed.
+   */
+  void SetComputeDivMFlag(const bool flag);
+
+  /**
+   * @brief Sets the flag controlling CloseDot autograd diagnostic prints.
+   *
+   * @param flag [in] A boolean flag indicating whether diagnostics are printed.
+   */
+  void SetCloseDotDebugFlag(const bool flag);
 
   /**
    * @brief Sets the maximum number of node pairs for far-range interaction

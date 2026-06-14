@@ -1,4 +1,7 @@
 #include "HignnModel.hpp"
+#include <torch/csrc/autograd/grad_mode.h>
+#include <climits>
+#include <algorithm>
 
 // Kokkos reduction for array data
 struct ArrReduce {
@@ -37,7 +40,7 @@ struct reduction_identity<ArrReduce> {
 };
 }  // namespace Kokkos
 
-void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
+void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f, DeviceDoubleMatrix divM) {
   std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
   // Captures the current time to start measuring elapsed time for performance
   // tracking.
@@ -45,6 +48,79 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
   if (mMPIRank == 0)
     std::cout << "start of FarDot" << std::endl;
   MPI_Barrier(MPI_COMM_WORLD);
+
+  const int initialFarNodeSize = mFarMatIPtr->extent(0);
+  if (initialFarNodeSize == 0) {
+    return;
+  }
+
+  {
+    auto &mFarMatI = *mFarMatIPtr;
+    auto &mFarMatJ = *mFarMatJPtr;
+    auto &mClusterTree = *mClusterTreePtr;
+
+    unsigned long localFarBlockCount = initialFarNodeSize;
+    unsigned long localFullRankRepresented = 0;
+    unsigned long localFullRankEffective = 0;
+
+    auto farMatIHost = Kokkos::create_mirror_view(mFarMatI);
+    auto farMatJHost = Kokkos::create_mirror_view(mFarMatJ);
+    Kokkos::deep_copy(farMatIHost, mFarMatI);
+    Kokkos::deep_copy(farMatJHost, mFarMatJ);
+
+    auto clusterTreeHost = Kokkos::create_mirror_view(mClusterTree);
+    Kokkos::deep_copy(clusterTreeHost, mClusterTree);
+
+    for (int i = 0; i < initialFarNodeSize; i++) {
+      const int nodeI = farMatIHost(i);
+      const int nodeJ = farMatJHost(i);
+
+      const unsigned long nodeISize =
+          clusterTreeHost(nodeI, 3) - clusterTreeHost(nodeI, 2);
+      const unsigned long nodeJSize =
+          clusterTreeHost(nodeJ, 3) - clusterTreeHost(nodeJ, 2);
+
+      const unsigned long blockFullRank =
+          3ul * std::min(nodeISize, nodeJSize);
+
+      // Stored/represented far block rank capacity.
+      localFullRankRepresented += blockFullRank;
+
+      // Effective contribution if symmetry applies the transpose block too.
+      if (mUseSymmetry && nodeI != nodeJ) {
+        localFullRankEffective += 2ul * blockFullRank;
+      } else {
+        localFullRankEffective += blockFullRank;
+      }
+    }
+
+    unsigned long globalFarBlockCount = localFarBlockCount;
+    unsigned long globalFullRankRepresented = localFullRankRepresented;
+    unsigned long globalFullRankEffective = localFullRankEffective;
+
+    MPI_Allreduce(MPI_IN_PLACE, &globalFarBlockCount, 1, MPI_UNSIGNED_LONG,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &globalFullRankRepresented, 1, MPI_UNSIGNED_LONG,
+                  MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &globalFullRankEffective, 1, MPI_UNSIGNED_LONG,
+                  MPI_SUM, MPI_COMM_WORLD);
+
+    if (mMPIRank == 0) {
+      std::cout << "Far blocks with full-rank accounting: "
+                << globalFarBlockCount << std::endl;
+      std::cout << "Total full rank of represented far blocks: "
+                << globalFullRankRepresented << std::endl;
+      std::cout << "Average full rank per represented far block: "
+                << (globalFarBlockCount > 0
+                        ? (double)globalFullRankRepresented /
+                              (double)globalFarBlockCount
+                        : 0.0)
+                << std::endl;
+      std::cout << "Total effective full rank of far blocks"
+                << " including symmetry: "
+                << globalFullRankEffective << std::endl;
+    }
+  }
 
   // Timing variables for profiling different parts of the algorithm.
   double queryDuration = 0.0;
@@ -71,6 +147,7 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
   int allowedWorkload = 0;  // Maximum workload allowed in current batch.
 
   const bool postCheck = false;
+  const bool computeDivM = mComputeDivM;
 
   // Device arrays and matrix pools for intermediate computation and batching.
   DeviceFloatVector relativeCoordPool(
@@ -81,6 +158,11 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                               9);  // Pool for C matrices.
   DeviceDoubleMatrix qMatPool("qMatPool", matPoolSize,
                               9);  // Pool for Q matrices.
+  DeviceDoubleMatrix divMMiddlePool("divMMiddlePool", maxWorkNodeSize * maxIter, 3); // Pool for storing summed qGrad (B_k * 1) per node per iteration
+  DeviceDoubleMatrix cDivMMiddlePool(
+    "cDivMMiddlePool",
+    maxWorkNodeSize * maxIter,
+    3);  // Pool for storing summed C-side transpose divergence for symmetry divM
   DeviceDoubleVector middleMatPool(
       "middleMatPool",
       middleMatPoolSize * 3);  // Middle matrix pool for accumulation.
@@ -152,6 +234,12 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
   auto &mClusterTree = *mClusterTreePtr;
 
   const int farNodeSize = mFarMatI.extent(0);  // Number of far node pairs
+  // Final accepted block-ACA iteration count for every far block.
+  DeviceIntVector farBlockAcceptedIterations(
+      "farBlockAcceptedIterations",
+      farNodeSize);
+
+  Kokkos::deep_copy(farBlockAcceptedIterations, 0);
   int finishedNodeSize = 0;  // Number of node pairs processed so far.
   int installedNode = 0;     // Next node index to be installed for batch.
   int totalCoord = 0;        // Tracks total coordinates processed in a batch.
@@ -371,26 +459,176 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
       Kokkos::fence();
 
       // do inference for CMat
+// #if USE_GPU
+//       auto options = torch::TensorOptions()
+//                          .dtype(torch::kFloat32)
+//                          .device(torch::kCUDA, mCudaDevice)
+//                          .requires_grad(true); //change to true
+// #else
+//       auto options = torch::TensorOptions()
+//                          .dtype(torch::kFloat32)
+//                          .device(torch::kCPU)
+//                          .requires_grad(true); //change to true
+// #endif
 #if USE_GPU
       auto options = torch::TensorOptions()
                          .dtype(torch::kFloat32)
-                         .device(torch::kCUDA, mCudaDevice)
-                         .requires_grad(false);
+                         .device(torch::kCUDA, mCudaDevice);
 #else
       auto options = torch::TensorOptions()
                          .dtype(torch::kFloat32)
-                         .device(torch::kCPU)
-                         .requires_grad(false);
+                         .device(torch::kCPU);
 #endif
+
+      // .clone() makes PyTorch own a copy of the Kokkos buffer so it doesn't
+      // hold a reference to memory Kokkos may reuse next iteration.
+      // torch::Tensor relativeCoordTensor =
+      //     torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options).clone();
+      // std::vector<c10::IValue> inputs;
+      // inputs.push_back(relativeCoordTensor);
+
+      // torch::NoGradGuard no_grad;
+      // auto resultTensor = mTwoBodyModel.forward(inputs).toTensor(); //NOTE: C matrix computed here
+
+      // // Store contiguous version to keep tensor alive and ensure sequential layout.
+      // auto resultTensor_contiguous = resultTensor.contiguous();
+      // auto dataPtr = resultTensor_contiguous.data_ptr<float>();
+
+      // ------------------------------------------------------------
+      // C matrix inference with autograd enabled.
+      // We need C-side gradients for the symmetric divM contribution.
+      // ------------------------------------------------------------
       torch::Tensor relativeCoordTensor =
-          torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options);
+          torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options)
+              .clone()
+              .detach();
+
+      if (computeDivM) {
+        relativeCoordTensor.set_requires_grad(true);
+      }
+
       std::vector<c10::IValue> inputs;
       inputs.push_back(relativeCoordTensor);
 
-      auto resultTensor = mTwoBodyModel.forward(inputs).toTensor();
+      torch::AutoGradMode grad_guard(computeDivM);
+      auto resultTensor = mTwoBodyModel.forward(inputs).toTensor(); // NOTE: C matrix computed here
 
-      // copy result to CMat
-      auto dataPtr = resultTensor.data_ptr<float>();
+      if (computeDivM) {
+        // ------------------------------------------------------------
+        // Compute C-side divergence needed for the symmetry branch.
+        //
+        // Direct far divM uses:
+        //     C * div(Q)
+        //
+        // Symmetric far divM needs:
+        //    -Q * div(C^T)
+        //
+        // For C_{a,b}, div(C^T)_b = sum_a d C_{a,b} / d r_a.
+        // Since r = X_J - X_I, derivative wrt source X_I gives a minus sign later.
+        // ------------------------------------------------------------
+        const float minDivMRelativeDistance2 = 1e-12f;
+
+        DeviceIntVector validCGradPair("validCGradPair", totalCoord);
+
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, totalCoord),
+            KOKKOS_LAMBDA(const int i) {
+              const float dx = relativeCoordPool(3 * i);
+              const float dy = relativeCoordPool(3 * i + 1);
+              const float dz = relativeCoordPool(3 * i + 2);
+              const float r2 = dx * dx + dy * dy + dz * dz;
+
+              validCGradPair(i) =
+                  (isfinite(r2) && r2 > minDivMRelativeDistance2) ? 1 : 0;
+            });
+        Kokkos::fence();
+
+        auto hostValidCGradPair = Kokkos::create_mirror_view(validCGradPair);
+        Kokkos::deep_copy(hostValidCGradPair, validCGradPair);
+
+        DeviceFloatMatrix cGradPairs("cGradPairs", totalCoord, 3);
+        auto hostCGradPairs = Kokkos::create_mirror_view(cGradPairs);
+
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, totalCoord * 3),
+            [&](const int i) {
+              hostCGradPairs(i / 3, i % 3) = 0.0;
+            });
+        Kokkos::fence();
+
+        for (int kk = 0; kk < 9; kk++) {
+          auto out = resultTensor.index({torch::indexing::Slice(), kk}).sum();
+
+          const bool retainGraph = kk < 8;
+
+          auto grad = torch::autograd::grad(
+                          {out},
+                          {relativeCoordTensor},
+                          {},
+                          retainGraph,
+                          false,
+                          false)[0]
+                          .detach()
+                          .to(torch::kCPU)
+                          .contiguous();
+
+          if (grad.numel() != totalCoord * 3) {
+            throw std::runtime_error("Unexpected FarDot C gradient size");
+          }
+
+          auto gradPtr = grad.data_ptr<float>();
+
+          const int matRow = kk / 3;
+          const int matCol = kk % 3;
+
+          for (int i = 0; i < totalCoord; i++) {
+            if (!hostValidCGradPair(i)) {
+              continue;
+            }
+
+            // For div(C^T)_matCol = sum_matRow d C_{matRow,matCol} / d r_matRow
+            const float gradValue = gradPtr[3 * i + matRow];
+
+            if (std::isfinite(gradValue)) {
+              hostCGradPairs(i, matCol) += gradValue;
+            }
+          }
+        }
+
+        Kokkos::deep_copy(cGradPairs, hostCGradPairs);
+
+        // Sum C-side divergence over node I rows for each work node/iteration.
+        // This will be used in the symmetry branch as -Q * div(C^T).
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, workNodeSize),
+            KOKKOS_LAMBDA(const int rank) {
+              const int nodeI = mFarMatI(workingNode(rank));
+
+              const int indexIStart = mClusterTree(nodeI, 2);
+              const int indexIEnd = mClusterTree(nodeI, 3);
+              const int workSizeI = indexIEnd - indexIStart;
+
+              const int relativeOffset = relativeCoordOffset(rank);
+              const int iter = workingNodeIteration(rank);
+              const int poolOffset = rank * maxIter + iter;
+
+              cDivMMiddlePool(poolOffset, 0) = 0.0;
+              cDivMMiddlePool(poolOffset, 1) = 0.0;
+              cDivMMiddlePool(poolOffset, 2) = 0.0;
+
+              for (int j = 0; j < workSizeI; j++) {
+                for (int d = 0; d < 3; d++) {
+                  cDivMMiddlePool(poolOffset, d) +=
+                      cGradPairs(relativeOffset + j, d);
+                }
+              }
+            });
+        Kokkos::fence();
+      }
+
+      // Store contiguous version to keep tensor alive and ensure sequential layout.
+      auto resultTensor_contiguous = resultTensor.detach().contiguous();
+      auto dataPtr = resultTensor_contiguous.data_ptr<float>();
 
       // Fill cMatPool with model outputs, enforcing symmetry on non-diagonal
       // elements.
@@ -696,26 +934,132 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
       Kokkos::fence();
 
       // do inference for QMat
+// #if USE_GPU
+//       auto options = torch::TensorOptions()
+//                          .dtype(torch::kFloat32)
+//                          .device(torch::kCUDA, mCudaDevice)
+//                          .requires_grad(true);
+// #else
+//       auto options = torch::TensorOptions()
+//                          .dtype(torch::kFloat32)
+//                          .device(torch::kCPU)
+//                          .requires_grad(true);
+// #endif
 #if USE_GPU
       auto options = torch::TensorOptions()
                          .dtype(torch::kFloat32)
-                         .device(torch::kCUDA, mCudaDevice)
-                         .requires_grad(false);
+                         .device(torch::kCUDA, mCudaDevice);
 #else
       auto options = torch::TensorOptions()
                          .dtype(torch::kFloat32)
-                         .device(torch::kCPU)
-                         .requires_grad(false);
+                         .device(torch::kCPU);
 #endif
+      // .clone() makes PyTorch own a copy of the Kokkos buffer so autograd
+      // doesn't hold a reference to memory Kokkos may reuse next iteration.
+      // torch::Tensor relativeCoordTensor =
+      //     torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options).clone();
+      // std::vector<c10::IValue> inputs;
+      // inputs.push_back(relativeCoordTensor);
+
+      // c10::InferenceMode guard;
+      // auto resultTensor = mTwoBodyModel.forward(inputs).toTensor(); //NOTE: Q matrix computed here
       torch::Tensor relativeCoordTensor =
-          torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options);
+          torch::from_blob(relativeCoordPool.data(), {totalCoord, 3}, options)
+              .clone()
+              .detach();
+      if (computeDivM) {
+        relativeCoordTensor.set_requires_grad(true);
+      }
+
       std::vector<c10::IValue> inputs;
       inputs.push_back(relativeCoordTensor);
 
-      auto resultTensor = mTwoBodyModel.forward(inputs).toTensor();
+      torch::AutoGradMode grad_guard(computeDivM);
+      auto resultTensor = mTwoBodyModel.forward(inputs).toTensor(); //NOTE: Q matrix computed here
+
+
+      if (computeDivM) {
+        const float minDivMRelativeDistance2 = 1e-12f;
+        DeviceIntVector validQGradPair("validQGradPair", totalCoord);
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, totalCoord),
+            KOKKOS_LAMBDA(const int i) {
+              const float dx = relativeCoordPool(3 * i);
+              const float dy = relativeCoordPool(3 * i + 1);
+              const float dz = relativeCoordPool(3 * i + 2);
+              const float r2 = dx * dx + dy * dy + dz * dz;
+              validQGradPair(i) =
+                  (isfinite(r2) && r2 > minDivMRelativeDistance2) ? 1 : 0;
+            });
+        Kokkos::fence();
+        auto hostValidQGradPair = Kokkos::create_mirror_view(validQGradPair);
+        Kokkos::deep_copy(hostValidQGradPair, validQGradPair);
+
+        DeviceFloatMatrix qGradPairs("qGradPairs", totalCoord, 3);
+        auto hostQGradPairs = Kokkos::create_mirror_view(qGradPairs);
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(
+                0, totalCoord * 3),
+            [&](const int i) { hostQGradPairs(i / 3, i % 3) = 0.0; });
+        Kokkos::fence();
+
+        for (int k = 0; k < 9; k++) {
+          auto out = resultTensor.index({torch::indexing::Slice(), k}).sum();
+          const bool retainGraph = k < 8;
+          auto grad = torch::autograd::grad({out}, {relativeCoordTensor}, {},
+                                            retainGraph, false, false)[0]
+                          .detach()
+                          .to(torch::kCPU)
+                          .contiguous();
+          if (grad.numel() != totalCoord * 3) {
+            throw std::runtime_error("Unexpected FarDot Q gradient size");
+          }
+          auto gradPtr = grad.data_ptr<float>();
+          const int row = k / 3;
+          const int col = k % 3;
+          for (int i = 0; i < totalCoord; i++) {
+            if (!hostValidQGradPair(i)) {
+              continue;
+            }
+            const float gradValue = gradPtr[3 * i + col];
+            if (std::isfinite(gradValue)) {
+              hostQGradPairs(i, row) += gradValue;
+            }
+          }
+        }
+        Kokkos::deep_copy(qGradPairs, hostQGradPairs);
+
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, workNodeSize),
+            KOKKOS_LAMBDA(const int rank) {
+            const int nodeJ = mFarMatJ(workingNode(rank));
+            const int indexJStart = mClusterTree(nodeJ, 2);
+            const int indexJEnd = mClusterTree(nodeJ, 3);
+            const int workSizeJ = indexJEnd - indexJStart;
+
+            const int relativeOffset = relativeCoordOffset(rank);
+            // const int iter = workingNodeIteration(rank) -1;
+            const int iter = workingNodeIteration(rank);
+            const int poolOffset = rank * maxIter + iter;
+
+            divMMiddlePool(poolOffset, 0) = 0.0;
+            divMMiddlePool(poolOffset, 1) = 0.0;
+            divMMiddlePool(poolOffset, 2) = 0.0;
+
+              for (int j = 0; j < workSizeJ; j++) {
+                for (int d = 0; d < 3; d++) {
+                  divMMiddlePool(poolOffset, d) +=
+                      qGradPairs(relativeOffset + j, d);
+                }
+              }
+            });
+        Kokkos::fence();
+      }
 
       // copy result to QMat
-      auto dataPtr = resultTensor.data_ptr<float>();
+      // Store contiguous version to keep tensor alive and ensure sequential layout.
+      auto resultTensor_contiguous_q = resultTensor.detach().contiguous();
+      auto dataPtr = resultTensor_contiguous_q.data_ptr<float>();
 
       // Copy Q matrix predictions into qMatPool, enforcing symmetry for
       // off-diagonal elements by averaging with their transpose.
@@ -1190,6 +1534,19 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
           });
       Kokkos::fence();
 
+      // Record final accepted ACA iteration count for each completed far block.
+      Kokkos::parallel_for(
+          Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, dotSize),
+          KOKKOS_LAMBDA(const int i) {
+              const int workingSlot = dotProductRank(i);
+              const int farBlockIndex = dotProductNode(i);
+
+              farBlockAcceptedIterations(farBlockIndex) =
+                  workingNodeIteration(workingSlot);
+          });
+
+      Kokkos::fence();
+
       // Initialize the middle matrix pool to zero for accumulation in the next
       // step.
       Kokkos::parallel_for(
@@ -1251,7 +1608,7 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
             const int workSizeI = indexIEnd - indexIStart;
 
             // For each row, for each component, and for each inner iteration,
-            // accumulate contributions to u
+            // accumulate contributions to u and divM
             Kokkos::parallel_for(
                 Kokkos::TeamThreadRange(teamMember,
                                         workSizeI * innerNumIter * 3),
@@ -1271,6 +1628,16 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                            middleMatPool(middleMatOffset + 3 * iter + k);
 
                   Kokkos::atomic_add(&u(indexIStart + index, row), sum);
+
+                  if (computeDivM) {
+                    //matrix-vector multiply: C * (B_k * 1) for divM
+                    double divMSum = 0.0;
+                    const int divMPoolOffset = workingNodeRank * maxIter + iter;
+                    for (int k = 0; k < 3; k++) {
+                      divMSum += cMatPool(cMatOffset + index, row * 3 + k) * divMMiddlePool(divMPoolOffset, k);
+                    }
+                    Kokkos::atomic_add(&divM(indexIStart + index, row), divMSum);
+                  }
                 });
           });
       Kokkos::fence();
@@ -1358,6 +1725,35 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
 
                     // Atomic add to final solution vector
                     Kokkos::atomic_add(&u(indexJStart + index, row), sum);
+
+                    if (computeDivM) {
+                      // ------------------------------------------------------------
+                      // Symmetric divM contribution.
+                      //
+                      // Direct far branch computes:
+                      //     divM_I += C * div(Q)
+                      //
+                      // Symmetry branch velocity computes:
+                      //     U_J += Q * C^T * F_I
+                      //
+                      // Therefore the corresponding divM contribution is:
+                      //     divM_J += - Q * div(C^T)
+                      //
+                      // The minus sign appears because the C-side relative coordinate is
+                      //     r = X_J - X_I
+                      // and the source coordinate for the symmetric block is X_I, so
+                      //     d/dX_I = - d/dr.
+                      // ------------------------------------------------------------
+                      double divMSum = 0.0;
+                      const int cDivMPoolOffset = workingNodeRank * maxIter + iter;
+
+                      for (int k = 0; k < 3; k++) {
+                        divMSum += qMatPool(qMatOffset + index, row * 3 + k) *
+                                  cDivMMiddlePool(cDivMPoolOffset, k);
+                      }
+
+                      Kokkos::atomic_add(&divM(indexJStart + index, row), -divMSum);
+                    }
                   });
             });
         Kokkos::fence();
@@ -1639,6 +2035,86 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
     }
   }
 
+  // ============================================================
+  // Local ACA rank statistics
+  // ============================================================
+
+  auto farBlockAcceptedIterationsHost =
+      Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(),
+          farBlockAcceptedIterations);
+
+  long long localFarBlockCount = farNodeSize;
+  long long localRecordedBlockCount = 0;
+  long long localAcceptedIterationSum = 0;
+
+  long long localFullScalarRankSum = 0;
+  double localPerBlockRankRatioSum = 0.0;
+
+  int localMinScalarRank = INT_MAX;
+  int localMaxScalarRank = 0;
+
+  // Needed to calculate the full rank of each corresponding far block.
+  auto farMatIHostForRank =
+      Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(), mFarMatI);
+
+  auto farMatJHostForRank =
+      Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(), mFarMatJ);
+
+  auto clusterTreeHostForRank =
+      Kokkos::create_mirror_view_and_copy(
+          Kokkos::HostSpace(), mClusterTree);
+
+  for (int block = 0; block < farNodeSize; block++) {
+    const int acceptedIterations =
+        farBlockAcceptedIterationsHost(block);
+
+    if (acceptedIterations <= 0) {
+      continue;
+    }
+
+    const long long acaScalarRank =
+        3LL * acceptedIterations;
+
+    const int nodeI = farMatIHostForRank(block);
+    const int nodeJ = farMatJHostForRank(block);
+
+    const long long nodeISize =
+        static_cast<long long>(
+            clusterTreeHostForRank(nodeI, 3) -
+            clusterTreeHostForRank(nodeI, 2));
+
+    const long long nodeJSize =
+        static_cast<long long>(
+            clusterTreeHostForRank(nodeJ, 3) -
+            clusterTreeHostForRank(nodeJ, 2));
+
+    // Maximum possible algebraic rank of the dense block:
+    // min(3*nI, 3*nJ) = 3*min(nI, nJ)
+    const long long fullScalarRank =
+        3LL * std::min(nodeISize, nodeJSize);
+
+    localRecordedBlockCount++;
+    localAcceptedIterationSum += acceptedIterations;
+    localFullScalarRankSum += fullScalarRank;
+
+    if (fullScalarRank > 0) {
+      localPerBlockRankRatioSum +=
+          static_cast<double>(acaScalarRank) /
+          static_cast<double>(fullScalarRank);
+    }
+
+    localMinScalarRank =
+        std::min(localMinScalarRank,
+                static_cast<int>(acaScalarRank));
+
+    localMaxScalarRank =
+        std::max(localMaxScalarRank,
+                static_cast<int>(acaScalarRank));
+  }
+
   std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 
   MPI_Barrier(MPI_COMM_WORLD);
@@ -1650,6 +2126,77 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
                 MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &maxInnerNumIter, 1, MPI_INT, MPI_MAX,
                 MPI_COMM_WORLD);
+
+  long long globalFarBlockCount = 0;
+  long long globalRecordedBlockCount = 0;
+  long long globalAcceptedIterationSum = 0;
+
+  long long globalFullScalarRankSum = 0;
+  double globalPerBlockRankRatioSum = 0.0;
+
+  int globalMinScalarRank = 0;
+  int globalMaxScalarRank = 0;
+
+  MPI_Allreduce(
+      &localFarBlockCount,
+      &globalFarBlockCount,
+      1,
+      MPI_LONG_LONG_INT,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  MPI_Allreduce(
+      &localRecordedBlockCount,
+      &globalRecordedBlockCount,
+      1,
+      MPI_LONG_LONG_INT,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  MPI_Allreduce(
+      &localAcceptedIterationSum,
+      &globalAcceptedIterationSum,
+      1,
+      MPI_LONG_LONG_INT,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  MPI_Allreduce(
+      &localFullScalarRankSum,
+      &globalFullScalarRankSum,
+      1,
+      MPI_LONG_LONG_INT,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  MPI_Allreduce(
+      &localPerBlockRankRatioSum,
+      &globalPerBlockRankRatioSum,
+      1,
+      MPI_DOUBLE,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  const int localMinForReduction =
+      localRecordedBlockCount > 0
+          ? localMinScalarRank
+          : INT_MAX;
+
+  MPI_Allreduce(
+      &localMinForReduction,
+      &globalMinScalarRank,
+      1,
+      MPI_INT,
+      MPI_MIN,
+      MPI_COMM_WORLD);
+
+  MPI_Allreduce(
+      &localMaxScalarRank,
+      &globalMaxScalarRank,
+      1,
+      MPI_INT,
+      MPI_MAX,
+      MPI_COMM_WORLD);
 
   // Print timing and summary statistics on rank 0 only
   if (mMPIRank == 0) {
@@ -1663,6 +2210,77 @@ void HignnModel::FarDot(DeviceDoubleMatrix u, DeviceDoubleMatrix f) {
         ckNormalizationDuration / 1e6, qkNormalizationDuration / 1e6,
         stopCriterionDuration / 1e6, resetDuration / 1e6);
     printf("max inner num iter: %d\n", maxInnerNumIter);
+
+    const long long globalScalarRankSum =
+        3 * globalAcceptedIterationSum;
+
+    const double averageAcceptedIterations =
+        globalRecordedBlockCount > 0
+            ? static_cast<double>(globalAcceptedIterationSum) /
+                  static_cast<double>(globalRecordedBlockCount)
+            : 0.0;
+
+    const double averageScalarRank =
+        globalRecordedBlockCount > 0
+            ? static_cast<double>(globalScalarRankSum) /
+                  static_cast<double>(globalRecordedBlockCount)
+            : 0.0;
+
+    const double averageFullScalarRank =
+        globalRecordedBlockCount > 0
+            ? static_cast<double>(globalFullScalarRankSum) /
+                  static_cast<double>(globalRecordedBlockCount)
+            : 0.0;
+
+    // Ratio of total ACA rank to total maximum/full rank.
+    const double totalAcaToFullRankRatio =
+        globalFullScalarRankSum > 0
+            ? static_cast<double>(globalScalarRankSum) /
+                  static_cast<double>(globalFullScalarRankSum)
+            : 0.0;
+
+    // Mean of the individual block ratios.
+    const double averagePerBlockAcaToFullRankRatio =
+        globalRecordedBlockCount > 0
+            ? globalPerBlockRankRatioSum /
+                  static_cast<double>(globalRecordedBlockCount)
+            : 0.0;
+
+    if (globalRecordedBlockCount == 0) {
+        globalMinScalarRank = 0;
+    }
+
+    std::cout
+        << "\n[FarDot mobility ACA rank statistics]\n"
+        << "Far blocks present:             "
+        << globalFarBlockCount << "\n"
+        << "Far blocks with recorded rank:  "
+        << globalRecordedBlockCount << "\n"
+        << "Total accepted ACA iterations:  "
+        << globalAcceptedIterationSum << "\n"
+        << "Average ACA iterations/block:   "
+        << averageAcceptedIterations << "\n"
+        << "Total scalar rank:              "
+        << globalScalarRankSum << "\n"
+        << "Average scalar rank/block:      "
+        << averageScalarRank << "\n"
+        << "Total full scalar rank:         "
+        << globalFullScalarRankSum << "\n"
+        << "Average full rank/block:        "
+        << averageFullScalarRank << "\n"
+        << "Total ACA rank / full rank:     "
+        << totalAcaToFullRankRatio << "\n"
+        << "Total ACA rank / full rank (%): "
+        << 100.0 * totalAcaToFullRankRatio << "%\n"
+        << "Average per-block rank ratio:   "
+        << averagePerBlockAcaToFullRankRatio << "\n"
+        << "Average per-block ratio (%):    "
+        << 100.0 * averagePerBlockAcaToFullRankRatio << "%\n"
+        << "Minimum scalar rank:            "
+        << globalMinScalarRank << "\n"
+        << "Maximum scalar rank:            "
+        << globalMaxScalarRank << "\n"
+        << std::endl;
 
     printf(
         "End of far dot. Dot time %.4fs\n",

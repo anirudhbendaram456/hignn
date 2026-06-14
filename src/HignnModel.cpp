@@ -231,6 +231,8 @@ HignnModel::HignnModel(pybind11::array_t<float> &coord, const int blockSize) {
   // default values
   mPostCheckFlag = false;
   mUseSymmetry = true;
+  mComputeDivM = false;
+  mCloseDotDebugFlag = false;
 
   mMaxFarDotWorkNodeSize = 5000;
 
@@ -310,6 +312,7 @@ void HignnModel::LoadTwoBodyModel(const std::string &modelPath) {
   std::vector<c10::IValue> inputs;
   inputs.push_back(testTensor);
 
+  torch::AutoGradMode grad_guard(false);
   auto testResult = mTwoBodyModel.forward(inputs);
 }
 
@@ -362,7 +365,8 @@ bool HignnModel::CloseFarCheck(HostFloatMatrix aux,
 }
 
 void HignnModel::Dot(pybind11::array_t<float> &uArray,
-                     pybind11::array_t<float> &fArray) {
+                     pybind11::array_t<float> &fArray, 
+                     pybind11::array_t<float> &divMArray) {
   if (mMPIRank == 0)
     std::cout << "start of Dot" << std::endl;
 
@@ -370,9 +374,12 @@ void HignnModel::Dot(pybind11::array_t<float> &uArray,
       std::chrono::high_resolution_clock::now();
 
   auto shape = fArray.shape();
+  
 
   DeviceDoubleMatrix u("u", shape[0], 3);
   DeviceDoubleMatrix f("f", shape[0], 3);
+  DeviceDoubleMatrix divM("divM", shape[0], 3);
+
 
   // initialize u
   Kokkos::parallel_for(
@@ -384,9 +391,20 @@ void HignnModel::Dot(pybind11::array_t<float> &uArray,
       });
   Kokkos::fence();
 
+  // initialize divM
+  Kokkos::parallel_for(
+      Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, divM.extent(0)),
+      KOKKOS_LAMBDA(const int i) {
+        divM(i, 0) = 0.0;
+        divM(i, 1) = 0.0;
+        divM(i, 2) = 0.0;
+      });
+  Kokkos::fence();
+
   // Access data from Python arrays
   auto fData = fArray.unchecked<2>();
   auto uData = uArray.mutable_unchecked<2>();
+  auto divMData = divMArray.mutable_unchecked<2>();
 
   // Host mirror for force array
   DeviceDoubleMatrix::HostMirror hostF = Kokkos::create_mirror_view(f);
@@ -408,9 +426,31 @@ void HignnModel::Dot(pybind11::array_t<float> &uArray,
   // tree.
   Reorder(mReorderedMap, f);
 
-  // Compute close- and far-range velocity contributions
-  CloseDot(u, f);
-  FarDot(u, f);
+  // // Compute close- and far-range velocity contributions
+  // CloseDot(u, f, divM);
+  // FarDot(u, f, divM);
+
+  // CloseDot always contributes close-field mobility velocity. It computes
+  // close-field divM only when mComputeDivM is enabled.
+  CloseDot(u, f, divM);
+
+
+  // Temporary scratch array used to discard the old FarDot divM.
+  // FarDot is still responsible for the far-field mobility velocity.
+  DeviceDoubleMatrix oldFarDivMScratch(
+      "oldFarDivMScratch",
+      divM.extent(0),
+      divM.extent(1));
+
+  Kokkos::deep_copy(oldFarDivMScratch, 0.0);
+
+  FarDot(u, f, oldFarDivMScratch);
+
+
+  if (mComputeDivM) {
+    // New independent derivative ACA contributes the far-field divM.
+    FarDivDot(divM);
+  }
 
   // Copy result velocities back to host
   DeviceDoubleMatrix::HostMirror hostU = Kokkos::create_mirror_view(u);
@@ -440,6 +480,26 @@ void HignnModel::Dot(pybind11::array_t<float> &uArray,
         uData(i, 0) = hostU(i, 0);
         uData(i, 1) = hostU(i, 1);
         uData(i, 2) = hostU(i, 2);
+      });
+  Kokkos::fence();
+
+  DeviceDoubleMatrix::HostMirror hostDivM = Kokkos::create_mirror_view(divM);
+  Kokkos::deep_copy(hostDivM, divM);
+  MPI_Allreduce(MPI_IN_PLACE, hostDivM.data(), divM.extent(0) * divM.extent(1), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+  Kokkos::deep_copy(divM, hostDivM);
+
+  BackwardReorder(mReorderedMap, divM);
+
+  Kokkos::deep_copy(hostDivM, divM);
+
+  // Copy divM to Python output array
+  Kokkos::parallel_for(
+      Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, divM.extent(0)),
+      [&](const int i) {
+        divMData(i, 0) = hostDivM(i, 0);
+        divMData(i, 1) = hostDivM(i, 1);
+        divMData(i, 2) = hostDivM(i, 2);
       });
   Kokkos::fence();
 
@@ -578,6 +638,14 @@ void HignnModel::SetPostCheckFlag(const bool flag) {
 
 void HignnModel::SetUseSymmetryFlag(const bool flag) {
   mUseSymmetry = flag;
+}
+
+void HignnModel::SetComputeDivMFlag(const bool flag) {
+  mComputeDivM = flag;
+}
+
+void HignnModel::SetCloseDotDebugFlag(const bool flag) {
+  mCloseDotDebugFlag = flag;
 }
 
 void HignnModel::SetMaxFarDotWorkNodeSize(const int size) {

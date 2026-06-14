@@ -27,12 +27,19 @@ PYBIND11_MODULE(hignn, m) {
       .def("set_max_relative_coord", &HignnModel::SetMaxRelativeCoord)
       .def("set_post_check_flag", &HignnModel::SetPostCheckFlag)
       .def("set_use_symmetry_flag", &HignnModel::SetUseSymmetryFlag)
+      .def("set_compute_divm_flag", &HignnModel::SetComputeDivMFlag)
+      .def("set_close_dot_debug_flag", &HignnModel::SetCloseDotDebugFlag)
       .def("set_max_far_field_distance", &HignnModel::SetMaxFarFieldDistance)
       .def("update_coord", &HignnModel::UpdateCoord)
-      .def("dot", &HignnModel::Dot)
-      .def("dense_dot", pybind11::overload_cast<pybind11::array_t<float> &,
-                                                pybind11::array_t<float> &>(
-                            &HignnModel::DenseDot));
+     //  .def("dot", &HignnModel::Dot)
+     //  .def("dense_dot", pybind11::overload_cast<pybind11::array_t<float> &,
+     //                                            pybind11::array_t<float> &>(
+     //                        &HignnModel::DenseDot));
+      .def("dot", &HignnModel::Dot, py::call_guard<py::gil_scoped_release>())
+      .def("dense_dot",
+          pybind11::overload_cast<pybind11::array_t<float> &,
+                              pybind11::array_t<float> &>(&HignnModel::DenseDot),
+          py::call_guard<py::gil_scoped_release>());
 
   py::class_<ExplicitEuler>(m, "ExplicitEuler")
       .def(py::init())
